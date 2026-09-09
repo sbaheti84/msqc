@@ -1,0 +1,7 @@
+numpy>=1.24
+pandas>=2.0
+pyarrow>=12
+pyteomics>=4.6
+# optional, only for `msqc train`
+# lightgbm>=4.0
+# scikit-learn>=1.3

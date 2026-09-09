@@ -1,0 +1,7 @@
+[server]
+# mzML files are large. Default is 200 MB, which most real runs exceed.
+maxUploadSize = 4000
+maxMessageSize = 4000
+
+[theme]
+base = "light"

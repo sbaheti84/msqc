@@ -1,0 +1,17 @@
+[project]
+name = "msqc"
+version = "0.1.0"
+description = "Spectrum-level QC and dark-proteome rescue triage for MS2 data"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "pandas>=2.0", "pyarrow>=12", "pyteomics>=4.6"]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.30", "plotly>=5.18"]
+ml = ["lightgbm>=4.0", "scikit-learn>=1.3"]
+
+[project.scripts]
+msqc = "msqc.cli:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
