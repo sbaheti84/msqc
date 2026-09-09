@@ -24,8 +24,8 @@ WIDGETS = {
 
 
 def _widget_calls():
-    tree = ast.parse(open(APP).read())
-    return [n for n in ast.walk(tree)
+    trees = [ast.parse(open(p).read()) for p in [APP, os.path.join(os.path.dirname(APP), "msqc", "rescue_ui.py")]]
+    return [n for tree in trees for n in ast.walk(tree)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
             and n.func.attr in WIDGETS]

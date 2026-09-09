@@ -50,7 +50,7 @@ DELTA_MASS_AMBIGUITIES = [
     # (name, delta, [alternative explanations], nearest_confusable_delta)
     ("Deamidation", 0.984016,
      ["13C isotope error - the search picked the wrong monoisotopic peak"],
-     0.997035),
+     1.003355),
     ("Methyl", 14.015650,
      ["G->A", "D->E", "V->I/L", "S->T", "N->Q", "formaldehyde adduct"],
      None),
@@ -154,7 +154,8 @@ def annotate_spectrum(mz, inten, peptide, precursor_charge,
         matched.append({**fr, "obs_mz": float(mz[j]),
                         "intensity": float(inten[j]), "error_ppm": float(err)})
         # bond index i means cleavage between residue i and i+1
-        bond = fr["index"] - 1
+        bond = (fr["index"] - 1 if fr["series"] == "b"
+                else n_res - fr["index"] - 1)
         if 0 <= bond < covered_b.size:
             (covered_b if fr["series"] == "b" else covered_y)[bond] = True
 

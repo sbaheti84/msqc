@@ -23,6 +23,9 @@ TABLE_COLUMNS = [
     "n_peaks_above_noise", "isolation_purity", "entropy",
     "peptide", "search_score", "denovo_peptide", "denovo_score",
     "cluster_id", "cluster_size", "ladder_label", "ladder_length",
+    "rescue_status", "denovo_source", "rescue_bond_coverage",
+    "rescue_explained_tic_frac", "rescue_precursor_error_ppm",
+    "rescue_search_peptide", "rescue_search_assignment_status",
 ]
 
 FEATURE_PANEL = [
@@ -44,7 +47,7 @@ FEATURE_PANEL = [
 CLASS_ORDER = [
     ("identified", "Identified by search"),
     ("rescue_candidate", "Rescue candidate"),
-    ("structured_non_peptide", "Structured, not peptide-like"),
+    ("structured_unresolved", "Structured, unresolved"),
     ("polymer_contaminant", "Polymer or detergent"),
     ("low_quality_unassigned", "Too poor to interpret"),
 ]
@@ -125,8 +128,8 @@ def build_payload(df: pd.DataFrame, max_spectra: int = 1500,
         else:
             rec["peaks"] = []
 
-        has_search = _present(r.get("peptide"))
-        has_denovo = _present(r.get("denovo_peptide"))
+        has_search = _present(r.get("peptide")) and not _present(r.get("annotation_error"))
+        has_denovo = _present(r.get("denovo_peptide")) and not _present(r.get("denovo_annotation_error"))
         pep = (r.get("modified_peptide") if _present(r.get("modified_peptide"))
                else r.get("peptide")) if has_search else (
             r.get("denovo_peptide") if has_denovo else None)
@@ -134,7 +137,13 @@ def build_payload(df: pd.DataFrame, max_spectra: int = 1500,
                                   ("de novo" if has_denovo else None))
         rec["theoretical"] = []
         if _present(pep):
-            for t in theoretical_fragments(pep):
+            try:
+                fragments = theoretical_fragments(pep)
+            except ValueError as exc:
+                fragments = []
+                rec["annotation_error"] = str(exc)
+                rec["fragment_source"] = None
+            for t in fragments:
                 rec["theoretical"].append(
                     [round(t["mz"], 4), t["label"], t["series"]])
         spectra.append(rec)
@@ -350,15 +359,15 @@ kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--rule-strong);
 const DATA = __DATA__;
 const CLASS_COLOUR = {
   identified:'var(--identified)', rescue_candidate:'var(--rescue)',
-  structured_non_peptide:'var(--structured)',
+  structured_unresolved:'var(--structured)',
   polymer_contaminant:'var(--polymer)', low_quality_unassigned:'var(--lowq)'
 };
 const CLASS_HEX = {
   identified:'#2E5E86', rescue_candidate:'#B24A1E',
-  structured_non_peptide:'#5E7355', polymer_contaminant:'#857A2E',
+  structured_unresolved:'#5E7355', polymer_contaminant:'#857A2E',
   low_quality_unassigned:'#BCC2BD'
 };
-const ORDER = ['identified','rescue_candidate','structured_non_peptide',
+const ORDER = ['identified','rescue_candidate','structured_unresolved',
                'polymer_contaminant','low_quality_unassigned'];
 
 const state = {

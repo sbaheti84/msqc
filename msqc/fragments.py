@@ -14,7 +14,7 @@ import re
 
 from .features import H2O, NH3, PROTON, RESIDUE_MASSES
 
-MOD_RE = re.compile(r"([A-Znc])(?:\[([-+]?\d*\.?\d+)\]|\+(\d*\.?\d+))?")
+MOD_RE = re.compile(r"([A-Znc])(?:\[([-+]?\d*\.?\d+)\]|([+-]\d*\.?\d+))?")
 
 ION_COLOURS = {"b": "b", "y": "y"}
 
@@ -24,6 +24,12 @@ def parse_peptide(seq: str):
     if not seq:
         return [], [], 0.0, 0.0
     seq = str(seq).strip().replace("(", "[").replace(")", "]")
+    # Support numeric ProForma terminal deltas; reject unsupported tokens rather
+    # than silently stripping modifications or treating their names as residues.
+    seq = re.sub(r"^\[([-+]?\d*\.?\d+)\]-", r"n[\1]", seq)
+    seq = re.sub(r"-\[([-+]?\d*\.?\d+)\]$", r"c[\1]", seq)
+    if "".join(m.group(0) for m in MOD_RE.finditer(seq)) != seq:
+        raise ValueError("Unsupported peptide notation; use exact numeric mass deltas.")
     residues, deltas = [], []
     nterm = cterm = 0.0
     for m in MOD_RE.finditer(seq):
@@ -36,7 +42,7 @@ def parse_peptide(seq: str):
             cterm += delta
             continue
         if aa not in RESIDUE_MASSES:
-            continue
+            raise ValueError(f"Unsupported residue: {aa}")
         residues.append(aa)
         deltas.append(delta)
     return residues, deltas, nterm, cterm

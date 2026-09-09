@@ -40,16 +40,29 @@ def read_fragpipe_psm(path: str) -> pd.DataFrame:
     })
     out["peptide"] = df[cols.get("peptide", spec_col)]
     out["modified_peptide"] = df.get(cols.get("modified peptide", ""), out["peptide"])
+    from .peptides import fragpipe_sequence
+    assigned_mods = df.get(cols.get("assigned modifications", ""), pd.Series("", index=df.index))
+    calc_mass = pd.to_numeric(df.get(cols.get("calculated peptide mass", ""), pd.Series(np.nan, index=df.index)), errors="coerce")
+    normalized = [fragpipe_sequence(p, m, a, mass) for p,m,a,mass in zip(
+        out["peptide"], out["modified_peptide"], assigned_mods, calc_mass)]
+    out["modified_peptide_raw"] = out["modified_peptide"]
+    out["modified_peptide"] = [p[0] for p in normalized]
+    out["annotation_error"] = [p[1] for p in normalized]
     out["protein"] = df.get(cols.get("protein", ""), "")
     out["search_score"] = pd.to_numeric(
         df.get(cols.get("hyperscore", "")), errors="coerce")
-    out["delta_score"] = pd.to_numeric(
+    out["delta_score"] = out["search_score"] - pd.to_numeric(
         df.get(cols.get("nextscore", "")), errors="coerce")
     out["expectation"] = pd.to_numeric(
         df.get(cols.get("expectation", "")), errors="coerce")
     out["delta_mass"] = pd.to_numeric(
         df.get(cols.get("delta mass", "")), errors="coerce")
     out["is_decoy"] = out["protein"].astype(str).str.contains("rev_|DECOY", case=False)
+    for names, dest in [(("q-value", "q value", "spectrum q-value", "spectrum_q"), "psm_qvalue"),
+                        (("posterior error probability", "pep"), "psm_pep"),
+                        (("precursor error ppm", "calibrated observed mass error (ppm)"), "precursor_error_ppm")]:
+        col = next((cols[n] for n in names if n in cols), None)
+        out[dest] = pd.to_numeric(df[col], errors="coerce") if col else np.nan
     out["engine"] = "fragpipe"
     out = out.dropna(subset=["scan_number"])
     out["scan_number"] = out["scan_number"].astype(int)
@@ -72,7 +85,9 @@ def read_sage_psm(path: str) -> pd.DataFrame:
         "search_score": pd.to_numeric(df.get(cols.get("hyperscore", "")), errors="coerce"),
         "delta_score": pd.to_numeric(df.get(cols.get("delta_next", "")), errors="coerce"),
         "expectation": pd.to_numeric(df.get(cols.get("spectrum_q", "")), errors="coerce"),
-        "delta_mass": pd.to_numeric(df.get(cols.get("isotope_error", "")), errors="coerce"),
+        "delta_mass": pd.to_numeric(df.get(cols.get("delta_mass", "")), errors="coerce"),
+        "isotope_error": pd.to_numeric(df.get(cols.get("isotope_error", "")), errors="coerce"),
+        "psm_qvalue": pd.to_numeric(df.get(cols.get("spectrum_q", "")), errors="coerce"),
     })
     out["is_decoy"] = df.get(cols.get("label", 1), 1) < 0
     out["engine"] = "sage"
@@ -81,64 +96,73 @@ def read_sage_psm(path: str) -> pd.DataFrame:
     return out
 
 
-def read_casanovo_mztab(path: str, run_id: str | None = None) -> pd.DataFrame:
-    """
-    Parse the PSM section of a Casanovo mzTab file.
+def read_casanovo_mztab(path: str, run_id: str | None = None,
+                        manifest: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Resolve native scan IDs or MGF indices through an explicit export manifest.
 
-    Casanovo writes spectra_ref as `ms_run[N]:scan=M`, where N indexes the
-    `ms_run[N]-location` lines in the metadata block. Those locations must be
-    resolved back to run names, otherwise a multi-run mzTab merges on scan
-    number alone and silently duplicates rows wherever two runs share a scan
-    number - which they almost always do.
+    Keep competing predictions in the raw output; select the best score per
+    spectrum here and expose candidate count and runner-up gap.
     """
-    rows, header = [], None
-    locations = {}
-    loc_re = re.compile(r"ms_run\[(\d+)\]-location")
+    from urllib.parse import unquote, urlparse
+    rows, header, locations = [], None, {}
     with open(path) as fh:
         for line in fh:
-            if line.startswith("MTD"):
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 3:
-                    m = loc_re.search(parts[1])
-                    if m:
-                        name = parts[2].split("/")[-1].split("\\")[-1]
-                        name = re.sub(r"\.(mzML|mzXML|mgf|raw|d)$", "", name,
-                                      flags=re.I)
-                        locations[m.group(1)] = name
-            elif line.startswith("PSH"):
-                header = line.rstrip("\n").split("\t")
-            elif line.startswith("PSM") and header:
-                rows.append(line.rstrip("\n").split("\t"))
-
-    cols = ["run_id", "scan_number", "denovo_peptide", "denovo_score"]
-    if not rows:
-        return pd.DataFrame(columns=cols)
-
-    df = pd.DataFrame(rows, columns=header)
-    ref = df.get("spectra_ref", pd.Series([""] * len(df))).astype(str)
-
-    scans = ref.str.extract(r"scan[=:](\d+)")[0]
-    if scans.isna().all():
-        scans = ref.str.extract(r"index[=:](\d+)")[0]
-
-    run_idx = ref.str.extract(r"ms_run\[(\d+)\]")[0]
-    if run_id:
-        runs = pd.Series(run_id, index=df.index)
-    elif locations and run_idx.notna().any():
-        runs = run_idx.map(locations).fillna("")
-    else:
-        # No metadata to resolve; try the USI-style forms instead.
-        runs = parse_spectrum_identifier(ref)["run_id"]
-
-    out = pd.DataFrame({
-        "run_id": runs.fillna("").values,
-        "scan_number": pd.to_numeric(scans, errors="coerce").values,
-        "denovo_peptide": df.get("sequence", "").values,
-        "denovo_score": pd.to_numeric(df.get("search_engine_score[1]"),
-                                      errors="coerce").values,
-    }).dropna(subset=["scan_number"])
-    out["scan_number"] = out["scan_number"].astype(int)
-    return out
+            parts = line.rstrip("\n").split("\t")
+            if parts[0] == "MTD" and len(parts) >= 3:
+                m = re.fullmatch(r"ms_run\[(\d+)\]-location", parts[1])
+                if m:
+                    locations[m[1]] = unquote(parts[2]).replace("\\", "/").rsplit("/", 1)[-1]
+            elif parts[0] == "PSH":
+                header = parts
+            elif parts[0] == "PSM" and header:
+                if len(parts) != len(header):
+                    raise ValueError("Malformed mzTab PSM row.")
+                rows.append(dict(zip(header, parts)))
+    columns = ["run_id", "scan_number", "denovo_peptide", "denovo_score",
+               "denovo_candidate_count", "denovo_score_gap", "denovo_modifications", "denovo_annotation_error"]
+    records = []
+    for row in rows:
+        ref = row.get("spectra_ref", "")
+        m = re.fullmatch(r"ms_run\[(\d+)\]:(.*)", ref)
+        if not m:
+            raise ValueError(f"Unsupported spectra_ref: {ref}")
+        filename, native = locations.get(m[1], ""), m[2]
+        idx = re.search(r"(?:^|\s)(index|scan)[=:](\d+)$", native)
+        if manifest is not None:
+            sub = manifest[manifest["mgf_file"] == filename]
+            if idx:
+                key = "mgf_index" if idx[1] == "index" else "export_scan"
+                sub = sub[sub[key] == int(idx[2])]
+            else:
+                sub = sub[sub["title"] == native]
+            if len(sub) != 1:
+                raise ValueError(f"Cannot uniquely resolve {filename}: {native} through MGF manifest.")
+            run, scan = sub.iloc[0]["run_id"], int(sub.iloc[0]["scan_number"])
+        else:
+            if not idx or idx[1] == "index" or filename.lower().endswith('.mgf'):
+                raise ValueError("MGF/index predictions require an export manifest; an index is not a scan number.")
+            run = run_id or re.sub(r"\.(mzML|mzXML|raw|d)$", "", filename, flags=re.I)
+            if not run:
+                raise ValueError("Prediction has no resolvable run ID.")
+            scan = int(idx[2])
+        seq = row.get("opt_global_cv_MS:1003169_proforma_peptidoform_sequence")
+        if not seq or seq == "null":
+            seq = row.get("sequence", "")
+        if not seq or seq == "null":
+            continue
+        records.append(dict(run_id=run, scan_number=scan, denovo_peptide=seq,
+                            denovo_score=pd.to_numeric(row.get("search_engine_score[1]"), errors="coerce"),
+                            denovo_modifications=row.get("modifications", "null"),
+                            denovo_annotation_error=("Exact modified sequence is unavailable; do not annotate the stripped sequence." if
+                                row.get("modifications", "null") not in ("null", "0", "") and not re.search(r"[\[+-]", seq) else "")))
+    if not records:
+        return pd.DataFrame(columns=columns)
+    out = pd.DataFrame(records).sort_values("denovo_score", ascending=False, na_position="last")
+    keys = ["run_id", "scan_number"]
+    counts = out.groupby(keys).size().rename("denovo_candidate_count")
+    gaps = out.groupby(keys)["denovo_score"].apply(
+        lambda v: v.iloc[0] - v.iloc[1] if len(v) > 1 else np.nan).rename("denovo_score_gap")
+    return out.drop_duplicates(keys).merge(counts, on=keys).merge(gaps, on=keys)
 
 
 def read_psm(path: str, engine: str = "auto") -> pd.DataFrame:
@@ -160,40 +184,44 @@ def read_psm(path: str, engine: str = "auto") -> pd.DataFrame:
 
 
 def join_psms(qc: pd.DataFrame, psms: pd.DataFrame,
-              match_on_run: bool = True) -> pd.DataFrame:
+              match_on_run: bool = True, max_qvalue: float = 0.01,
+              assume_prefiltered: bool = False, run_mapping: dict | None = None) -> pd.DataFrame:
+    """Join exact spectrum keys; only confidence-qualified targets are assigned.
+
+    Missing confidence remains tentative unless the caller explicitly declares
+    the input prefiltered. PEP is retained as evidence, not confused with a q-value.
     """
-    Left-join PSMs onto the QC table. If run IDs do not line up between the
-    mzML filename and the search output, fall back to scan number only and
-    say so loudly, because silent mismatches produce a fake rescue pile.
-    """
+    if not 0 <= max_qvalue <= 1:
+        raise ValueError("max_qvalue must be between 0 and 1")
+    qc = qc.copy()
     if psms.empty:
-        qc = qc.copy()
         qc["assigned"] = False
+        qc["assignment_status"] = "unassigned"
         return qc
-
-    psms = psms[~psms.get("is_decoy", False).astype(bool)].copy()
-
+    psms = psms.copy()
+    if run_mapping:
+        psms["run_id"] = psms["run_id"].replace(run_mapping)
+    if not match_on_run and (qc["run_id"].nunique() != 1 or psms["run_id"].nunique() != 1):
+        raise ValueError("Scan-only matching requires exactly one QC run and one PSM run.")
     keys = ["run_id", "scan_number"] if match_on_run else ["scan_number"]
-    if match_on_run:
-        overlap = set(qc["run_id"]) & set(psms["run_id"])
-        if not overlap:
-            print("  [warn] no run_id overlap between mzML and PSM table "
-                  f"(mzML: {sorted(set(qc['run_id']))[:3]}, "
-                  f"PSM: {sorted(set(psms['run_id']))[:3]}). "
-                  "Falling back to scan-number-only join. Verify this is correct.")
-            keys = ["scan_number"]
-            psms = psms.drop(columns=["run_id"])
-
-    psms = psms.sort_values("search_score", ascending=False).drop_duplicates(keys)
-    merged = qc.merge(psms, on=keys, how="left", suffixes=("", "_psm"))
-    merged["assigned"] = merged["peptide"].notna()
-
-    rate = merged["assigned"].mean()
-    print(f"  joined {int(merged['assigned'].sum()):,} PSMs to "
-          f"{len(merged):,} MS2 scans ({rate:.1%} identification rate)")
-    if rate < 0.02:
-        print("  [warn] identification rate under 2%. The join key is probably "
-              "wrong, or the search failed. Check before trusting rescue output.")
+    if match_on_run and not set(qc["run_id"]) & set(psms["run_id"]):
+        raise ValueError("No matching run IDs. Supply an explicit run_mapping; scan-only fallback is disabled.")
+    if not match_on_run:
+        psms = psms.drop(columns="run_id")
+    decoy = psms.get("is_decoy", pd.Series(False, index=psms.index)).fillna(False).astype(bool)
+    q = pd.to_numeric(psms.get("psm_qvalue", pd.Series(np.nan, index=psms.index)), errors="coerce")
+    psms["_accepted"] = (~decoy & (q.between(0, max_qvalue) | (q.isna() & assume_prefiltered)))
+    # Decoys never supply a target annotation; retain tentative target candidates.
+    psms = psms[~decoy].copy()
+    psms["search_score"] = pd.to_numeric(psms.get("search_score", np.nan), errors="coerce")
+    psms = psms.sort_values(["_accepted", "search_score"], ascending=False).drop_duplicates(keys)
+    overlap = [c for c in psms.columns if c in qc and c not in keys]
+    qc = qc.drop(columns=overlap)
+    merged = qc.merge(psms, on=keys, how="left", validate="many_to_one")
+    has_peptide = merged["peptide"].fillna("").ne("")
+    merged["assigned"] = merged.pop("_accepted").astype("boolean").fillna(False).astype(bool) & has_peptide
+    merged["assignment_status"] = np.select(
+        [merged["assigned"], has_peptide], ["confident", "tentative"], default="unassigned")
     return merged
 
 

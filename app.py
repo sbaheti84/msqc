@@ -21,6 +21,8 @@ import io
 import os
 import sys
 import tempfile
+import uuid
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from msqc import checklist as ck
 from msqc import convert, fragments, pipeline, rescue, score
+from msqc.rescue_ui import page_rescue
 
 st.set_page_config(page_title="msqc", layout="wide",
                    initial_sidebar_state="expanded")
@@ -39,7 +42,7 @@ st.set_page_config(page_title="msqc", layout="wide",
 BUCKET_COLOURS = {
     "identified": "#5B7FA6",
     "rescue_candidate": "#D08A2E",
-    "structured_non_peptide": "#7C6BA8",
+    "structured_unresolved": "#7C6BA8",
     "polymer_contaminant": "#A6564E",
     "low_quality_unassigned": "#9AA3AA",
 }
@@ -75,7 +78,12 @@ FEATURE_HELP = {
 # Loading and running
 # ---------------------------------------------------------------------------
 
-WORKDIR = os.path.join(tempfile.gettempdir(), "msqc_session")
+if "workdir" not in st.session_state:
+    root = os.environ.get("MSQC_WORKDIR")
+    if root:
+        os.makedirs(root, exist_ok=True)
+    st.session_state["workdir"] = tempfile.mkdtemp(prefix="msqc_", dir=root)
+WORKDIR = st.session_state["workdir"]
 
 
 def _save_uploads(files, subdir):
@@ -84,7 +92,7 @@ def _save_uploads(files, subdir):
     os.makedirs(d, exist_ok=True)
     paths = []
     for f in files or []:
-        dest = os.path.join(d, f.name)
+        dest = os.path.join(d, os.path.basename(f.name))
         with open(dest, "wb") as fh:
             fh.write(f.getbuffer())
         paths.append(dest)
@@ -118,9 +126,17 @@ def load_parquet(path: str, mtime: float) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Running the interpretation checklist…")
-def run_checklist_cached(key: str, analyzer: str, label):
-    df = st.session_state["qc"]
+def run_checklist_cached(df: pd.DataFrame, analyzer: str, label):
     return rescue.validate_psms(df, analyzer=analyzer, label=label)
+
+
+def _cli_default():
+    for i, arg in enumerate(sys.argv):
+        if arg == "--qc" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("--qc="):
+            return arg.split("=", 1)[1]
+    return ""
 
 
 def page_load():
@@ -186,12 +202,18 @@ def page_load():
                             placeholder="results/qc_triaged.parquet", key="text_input_185")
         up = st.file_uploader("…or upload it", type=["parquet"], key="file_uploader_187")
         if up is not None:
-            st.session_state["qc"] = pd.read_parquet(io.BytesIO(up.getvalue()))
-            st.session_state["qc_key"] = up.name
+            source_key = (up.name, hashlib.sha256(up.getvalue()).hexdigest())
+            if st.session_state.get("qc_source") != source_key:
+                st.session_state["qc"] = pd.read_parquet(io.BytesIO(up.getvalue()))
+                st.session_state["qc_key"] = str(uuid.uuid4())
+                st.session_state["qc_source"] = source_key
             st.success(f"Loaded {len(st.session_state['qc']):,} spectra.")
         elif p and os.path.exists(p):
-            st.session_state["qc"] = load_parquet(p, os.path.getmtime(p))
-            st.session_state["qc_key"] = p
+            source_key = (p, os.path.getmtime(p))
+            if st.session_state.get("qc_source") != source_key:
+                st.session_state["qc"] = load_parquet(p, os.path.getmtime(p))
+                st.session_state["qc_key"] = str(uuid.uuid4())
+                st.session_state["qc_source"] = source_key
             st.success(f"Loaded {len(st.session_state['qc']):,} spectra.")
         elif p:
             st.error("File not found.")
@@ -292,6 +314,7 @@ def page_load():
                             help="Start with 'rule'. It needs no training "
                                  "data and works on the first file you "
                                  "process.", key="selectbox_291")
+    model_path = st.text_input("Trained QC model path", key="load_model_path") if scorer == "model" else None
     qthr = c[1].slider("Quality threshold", 0.0, 1.0, 0.6, 0.05, key="slider_295")
     mtag = c[2].slider("Minimum sequence tag", 0, 8, 3, key="slider_296")
     maxp = c[3].number_input("Peaks per spectrum", 50, 500, 150, 25,
@@ -304,6 +327,11 @@ def page_load():
                                  "every peptide-agnostic metric and will "
                                  "otherwise fill your GPU queue with "
                                  "detergent.", key="checkbox_301")
+
+    confidence = st.columns(2)
+    max_qvalue = confidence[0].number_input("Maximum input PSM q-value", min_value=0., max_value=1., value=.01, format="%.4f", key="load_max_qvalue")
+    assume_prefiltered = confidence[1].checkbox("Input PSM tables are already FDR-filtered", key="load_prefiltered",
+        help="Explicitly allow target PSMs without q-values to count as identified. Otherwise they remain tentative.")
 
     est = sum(os.path.getsize(p) for p in mzml_paths) / 1e6
     st.caption(f"About {est:,.0f} MB of mzML. Extraction runs at roughly "
@@ -318,9 +346,10 @@ def page_load():
         try:
             qc = pipeline.run_pipeline(
                 mzml_paths, psm_paths, pep_path, prot_path,
-                scorer=scorer, qc_threshold=qthr, min_tag=mtag,
+                scorer=scorer, model_path=model_path, qc_threshold=qthr, min_tag=mtag,
                 keep_polymers=keep_poly, max_peaks=int(maxp),
-                convert_backend=conv_backend, progress=cb)
+                convert_backend=conv_backend, max_qvalue=max_qvalue,
+                assume_prefiltered=assume_prefiltered, progress=cb)
         except Exception as e:
             bar.empty()
             st.exception(e)
@@ -330,7 +359,8 @@ def page_load():
         for w in qc.attrs.get("warnings", []):
             st.error(w)
         st.session_state["qc"] = qc
-        st.session_state["qc_key"] = "|".join(sorted(mzml_paths))
+        st.session_state["qc_key"] = str(uuid.uuid4())
+        st.session_state["mzml_paths"] = qc.attrs.get("mzml_paths", mzml_paths)
         st.success(f"Done. {len(qc):,} MS2 spectra across "
                    f"{qc['run_id'].nunique()} run(s).")
         st.dataframe(pipeline.run_summary(qc).round(3),
@@ -341,9 +371,7 @@ def page_load():
         with open(out, "rb") as fh:
             st.download_button("Download qc_triaged.parquet", fh.read(),
                                "qc_triaged.parquet", key="download_button_342")
-        st.info("Move to the other tabs to explore. To continue on the "
-                "command line, download the parquet and run "
-                "`msqc triage`/`annotate` against it.")
+        st.info("Open Run rescue to cluster spectra and run external search or de novo tools from this app.")
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +407,7 @@ def sidebar_filters(df):
             f &= rt.between(a, b)
 
     tag = st.sidebar.slider("Minimum sequence tag", 0,
-                            int(df["longest_tag"].max()), 0, key="slider_381")
+                            max(int(df["longest_tag"].fillna(0).max()), 1), 0, key="slider_381")
     f &= df["longest_tag"] >= tag
 
     if df["isolation_purity"].notna().any():
@@ -498,8 +526,8 @@ def page_overview(df, view):
 - **identified** — the search explained it. Nothing to do.
 - **rescue_candidate** — strong peptide structure, unassigned, not a polymer.
   This is the GPU queue.
-- **structured_non_peptide** — good signal, no peptide pattern. Glycans,
-  lipids, crosslinks. Different tools.
+- **structured_unresolved** — good signal with insufficient tag evidence.
+  Review for alternative fragmentation or specialized search.
 - **polymer_contaminant** — repeat ladder. Fix sample prep.
 - **low_quality_unassigned** — not enough signal. Most of the pile.
 """)
@@ -542,9 +570,9 @@ def page_triage(df, view):
     xcol = c[0].selectbox("X axis", ["qc_score", "longest_tag", "entropy",
                                      "isolation_purity", "snr_proxy",
                                      "n_complementary", "rt_min"], index=0, key="selectbox_542")
-    ycol = c[1].selectbox("Y axis", ["search_score", "qc_score",
+    ycol = c[1].selectbox("Y axis", [name for name in ["search_score", "qc_score",
                                      "n_peaks_above_noise", "precursor_mz",
-                                     "isolation_purity", "longest_tag"],
+                                     "isolation_purity", "longest_tag"] if name in df.columns],
                           index=0, key="selectbox_545")
     n_max = c[2].number_input("Max points", 1000, 200000, 20000, 1000,
                               help="Plotly slows down past ~50k points. "
@@ -628,12 +656,22 @@ def page_spectrum(df, view):
     m[5].metric("Bucket", row["triage_class"].replace("_", " "))
 
     pep_options = {}
+    if isinstance(row.get("annotation_error"), str) and row["annotation_error"]:
+        st.warning(row["annotation_error"])
+    elif isinstance(row.get("rescue_search_modified_peptide"), str) and row["rescue_search_modified_peptide"]:
+        pep_options["rescue search"] = row["rescue_search_modified_peptide"]
     if isinstance(row.get("modified_peptide"), str) and row["modified_peptide"]:
         pep_options["search assignment"] = row["modified_peptide"]
-    elif isinstance(row.get("peptide"), str) and row["peptide"]:
+    elif isinstance(row.get("peptide"), str) and row["peptide"] and not row.get("annotation_error"):
         pep_options["search assignment"] = row["peptide"]
-    if isinstance(row.get("denovo_peptide"), str) and row["denovo_peptide"]:
-        pep_options["de novo (Casanovo)"] = row["denovo_peptide"]
+    if isinstance(row.get("denovo_annotation_error"), str) and row["denovo_annotation_error"]:
+        st.warning(row["denovo_annotation_error"])
+    elif isinstance(row.get("denovo_peptide"), str) and row["denovo_peptide"]:
+        try:
+            fragments.parse_peptide(row["denovo_peptide"])
+            pep_options["de novo (Casanovo)"] = row["denovo_peptide"]
+        except ValueError as exc:
+            st.warning(str(exc))
     pep_options["none (raw spectrum)"] = ""
     custom = st.text_input("Or type a peptide to test against this spectrum",
                            placeholder="PEPT[79.9663]IDEK", key="text_input_638")
@@ -685,26 +723,25 @@ def page_queue(df, view):
 
     has_cluster = "cluster_size" in q.columns and q["cluster_size"].notna().any()
     if has_cluster:
-        st.caption("Sorted by cluster evidence. A spectrum seen once is noise; "
-                   "a tight cluster spanning many runs is a real molecule.")
+        st.caption("Cluster support measures reproducibility. Singletons can be valid; repeated signals still require identification evidence.")
         c = st.columns(3)
-        min_size = c[0].slider("Minimum cluster size", 1,
-                               int(q["cluster_size"].max()), 2, key="slider_691")
-        min_runs = c[1].slider("Seen in at least N runs", 1,
+        min_size = c[0].number_input("Minimum cluster size", 1,
+                               max(int(q["cluster_size"].max()), 1), 1, key="slider_691")
+        min_runs = c[1].number_input("Seen in at least N runs", 1,
                                max(int(q["cluster_n_runs"].max()), 1), 1, key="slider_693")
         q = q[(q["cluster_size"].fillna(1) >= min_size)
               & (q["cluster_n_runs"].fillna(1) >= min_runs)]
         c[2].metric("Candidates remaining", f"{len(q):,}")
     else:
-        st.info("No cluster assignments in this table. Run falcon on "
-                "`rescue_candidates.mgf` then `msqc annotate` to add the "
-                "evidence columns — cluster size is the strongest filter "
-                "you have.")
+        st.info("Open Run rescue to cluster this queue and bring the results back automatically.")
 
     cols = [c for c in ["run_id", "scan_number", "rt_min", "precursor_mz",
                         "charge", "qc_score", "longest_tag", "n_complementary",
                         "isolation_purity", "cluster_id", "cluster_size",
-                        "cluster_n_runs", "denovo_peptide", "denovo_score"]
+                        "cluster_n_runs", "denovo_peptide", "denovo_score",
+                        "denovo_source", "rescue_status", "rescue_bond_coverage",
+                        "rescue_explained_tic_frac", "rescue_precursor_error_ppm",
+                        "rescue_search_peptide", "rescue_search_assignment_status"]
             if c in q.columns]
     sort_by = ["cluster_size", "qc_score"] if has_cluster else ["qc_score"]
     show = q[cols].sort_values(sort_by, ascending=False)
@@ -746,13 +783,12 @@ def page_checklist(df, view):
              "PSMs look broken.", key="selectbox_742")
     label = c[1].selectbox("Isobaric label", [None, "TMT", "iTRAQ"], key="selectbox_747")
     prec, fppm, fda = ck.ANALYZER_TOLERANCE[analyzer]
-    c[2].markdown(f"**Tolerances**  \nprecursor {prec:.0f} ppm  \nfragment "
+    c[2].markdown("**Tolerances**  \nprecursor " + (f"{prec:.0f} ppm" if prec is not None else "not checked") + "  \nfragment "
                   + (f"{fppm:.0f} ppm" if fda is None else f"{fda} Da"))
 
     if not st.button("Run checklist", type="primary", key="button_752"):
         return
-    res = run_checklist_cached(st.session_state.get("qc_key", ""),
-                               analyzer, label)
+    res = run_checklist_cached(df, analyzer, label)
     if res.empty:
         st.warning("No assigned PSMs with peptides in this table.")
         return
@@ -893,7 +929,7 @@ def main():
     st.caption("Spectrum quality triage and dark-proteome rescue")
 
     tabs = st.tabs(["1 · Load & run", "Overview", "Triage", "Spectrum",
-                    "Rescue queue", "PSM checklist", "Features"])
+                    "Rescue queue", "PSM checklist", "Features", "Run rescue"])
 
     render(tabs[0], page_load, name="Load & run")
 
@@ -918,7 +954,7 @@ def main():
     st.sidebar.caption(f"{qc['run_id'].nunique()} run(s), {len(qc):,} MS2 "
                        f"spectra loaded")
     if st.sidebar.button("Clear loaded data", key="button_903"):
-        for k in ("qc", "qc_key"):
+        for k in ("qc", "qc_key", "qc_source"):
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -928,7 +964,8 @@ def main():
             (tabs[3], page_spectrum, "Spectrum"),
             (tabs[4], page_queue, "Rescue queue"),
             (tabs[5], page_checklist, "PSM checklist"),
-            (tabs[6], page_features, "Features")]:
+            (tabs[6], page_features, "Features"),
+            (tabs[7], page_rescue, "Run rescue")]:
         render(tab, fn, qc, view, name=name)
 
 

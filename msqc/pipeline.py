@@ -114,7 +114,7 @@ def run_pipeline(mzml_paths, psm_paths=None, peptide_path=None,
                  protein_path=None, scorer="rule", model_path=None,
                  qc_threshold=0.6, min_tag=3, keep_polymers=False,
                  max_peaks=150, frag_tol=0.02, convert_dir=None,
-                 convert_backend=None,
+                 convert_backend=None, max_qvalue=0.01, assume_prefiltered=False,
                  progress: Callable[[float, str], None] | None = None):
     """
     mzML in, triaged spectrum table out. `progress(fraction, message)` is
@@ -168,7 +168,8 @@ def run_pipeline(mzml_paths, psm_paths=None, peptide_path=None,
         tick(0.83, "Joining search results…")
         psms = pd.concat([psm_mod.read_psm(p) for p in psm_paths],
                          ignore_index=True)
-        qc = psm_mod.join_psms(qc, psms)
+        qc = psm_mod.join_psms(qc, psms, max_qvalue=max_qvalue,
+                               assume_prefiltered=assume_prefiltered)
     else:
         qc["assigned"] = False
 
@@ -188,6 +189,7 @@ def run_pipeline(mzml_paths, psm_paths=None, peptide_path=None,
 
     tick(1.0, "Done.")
     qc.attrs["warnings"] = warnings
+    qc.attrs["mzml_paths"] = mzml_paths
     return qc
 
 

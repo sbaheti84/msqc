@@ -230,12 +230,12 @@ def polymer_ladder(mz, inten, tol=0.02, min_chain=4):
     return best
 
 
-def neutral_loss_features(mz, inten, prec_mz, tol=0.02):
+def neutral_loss_features(mz, inten, prec_mz, tol=0.02, charge=1):
     """Water/ammonia losses from the precursor: sample-prep and peptide signals."""
     out = {}
     total = inten.sum() if inten.size else 1.0
     for label, loss in (("h2o", H2O), ("nh3", NH3), ("phospho", 97.9769)):
-        target = prec_mz - loss
+        target = prec_mz - loss / max(int(charge), 1)
         hit = np.abs(mz - target) < tol
         out[f"loss_{label}_frac"] = float(inten[hit].sum() / total) if total > 0 else 0.0
     return out
@@ -343,7 +343,7 @@ def spectrum_features(mz, inten, prec_mz, charge, ms1=None,
     f["ladder_label"] = name
     f["is_polymer_like"] = bool(chain >= 5 and name != "")
 
-    f.update(neutral_loss_features(smz, sint, prec_mz))
+    f.update(neutral_loss_features(smz, sint, prec_mz, charge=charge))
 
     if ms1 is not None:
         purity, others = isolation_purity(

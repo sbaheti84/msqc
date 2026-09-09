@@ -106,9 +106,9 @@ def build_labels(df: pd.DataFrame,
     assigned = df.get("assigned", pd.Series(False, index=df.index)).fillna(False)
     label[assigned.astype(bool)] = 1
 
-    if denovo_score_col in df.columns:
+    if denovo_score_col in df.columns and "denovo_validated" in df.columns:
         strong_denovo = df[denovo_score_col].fillna(-1) >= denovo_threshold
-        label[strong_denovo & ~assigned.astype(bool)] = 1
+        label[strong_denovo & df["denovo_validated"].fillna(False).astype(bool) & ~assigned.astype(bool)] = 1
 
     # hold out structurally strong but unassigned spectra
     strong = (df["longest_tag"].fillna(0) >= 3) & (df["n_complementary"].fillna(0) >= 2)
@@ -120,9 +120,9 @@ def build_labels(df: pd.DataFrame,
 def train_model(df: pd.DataFrame, out_path: str,
                 group_col: str = "run_id", seed: int = 0):
     """
-    Train a gradient-boosted classifier. Splits by run so the same peptide
-    cannot appear on both sides of the split - a random split leaks badly and
-    gives a fake AUC near 0.99.
+    Train a gradient-boosted classifier with run holdout. Peptides may recur
+    across runs; peptide-disjoint and external-dataset evaluation are still
+    required to measure generalization beyond familiar peptides.
     """
     try:
         from sklearn.metrics import roc_auc_score
@@ -158,6 +158,8 @@ def train_model(df: pd.DataFrame, out_path: str,
     X = train[feats].replace([np.inf, -np.inf], np.nan)
 
     runs = train[group_col].unique() if group_col in train else np.array(["all"])
+    if len(runs) < 2:
+        raise SystemExit("At least two independent runs are required; random spectrum splitting is disabled.")
     rng = np.random.default_rng(seed)
     runs = np.asarray(runs, dtype=object)
     rng.shuffle(runs)
@@ -167,6 +169,8 @@ def train_model(df: pd.DataFrame, out_path: str,
     is_val = train[group_col].isin(holdout) if holdout else pd.Series(
         rng.random(len(train)) < 0.25, index=train.index)
 
+    if y[~is_val].nunique() < 2:
+        raise SystemExit("Training runs need both label classes. Supply more independent runs.")
     model = make_model()
     model.fit(X[~is_val], y[~is_val])
 
@@ -181,10 +185,10 @@ def train_model(df: pd.DataFrame, out_path: str,
     # single-feature baselines, so you can see whether the model earns its keep
     baselines = {}
     for c in ["longest_tag", "n_peaks_above_noise", "entropy", "n_complementary"]:
-        if c in X.columns and y.nunique() == 2:
-            v = X[c].fillna(X[c].median())
+        if c in X.columns and y[is_val].nunique() == 2:
+            v = X.loc[is_val, c].fillna(X.loc[~is_val, c].median())
             try:
-                baselines[c] = float(roc_auc_score(y, v))
+                baselines[c] = float(roc_auc_score(y[is_val], v))
             except ValueError:
                 pass
     report["single_feature_auc"] = baselines
@@ -231,7 +235,9 @@ def apply_model(df: pd.DataFrame, model_path: str) -> pd.Series:
 def add_quality_score(df: pd.DataFrame, scorer: str = "rule",
                       model_path: str | None = None) -> pd.DataFrame:
     df = df.copy()
-    if scorer == "model" and model_path and os.path.exists(model_path):
+    if scorer == "model" and (not model_path or not os.path.isfile(model_path)):
+        raise ValueError("Model scoring requires an existing trained model file.")
+    if scorer == "model":
         df["qc_score"] = apply_model(df, model_path)
         df["qc_scorer"] = "model"
     else:

@@ -291,7 +291,8 @@ def cmd_triage(args):
     if args.psm:
         psms = pd.concat([psm_mod.read_psm(p, args.engine) for p in args.psm],
                          ignore_index=True)
-        df = psm_mod.join_psms(df, psms)
+        df = psm_mod.join_psms(df, psms, max_qvalue=args.max_qvalue,
+                                assume_prefiltered=args.assume_prefiltered)
     else:
         df["assigned"] = False
         print("  [warn] no PSM table given. Every spectrum will be treated as "
@@ -320,42 +321,18 @@ def cmd_triage(args):
 
 
 def cmd_annotate(args):
+    from .identity import attach
     df = _read_qc(args.qc)
-
     if args.casanovo:
-        dn = psm_mod.read_casanovo_mztab(args.casanovo)
-        keys = ["scan_number"] if dn["run_id"].eq("").all() else \
-            ["run_id", "scan_number"]
-        dn = dn[keys + ["denovo_peptide", "denovo_score"]]
-        df = df.drop(columns=[c for c in ("denovo_peptide", "denovo_score")
-                              if c in df.columns])
-        df = df.merge(dn, on=keys, how="left")
-        print(f"[annotate] attached {dn['denovo_peptide'].notna().sum():,} "
-              "de novo sequences")
-
+        manifest_path = getattr(args, "manifest", None)
+        manifest = pd.read_csv(manifest_path) if manifest_path else None
+        dn = psm_mod.read_casanovo_mztab(args.casanovo, manifest=manifest)
+        df = attach(df, dn)
+        print(f"[annotate] attached {len(dn):,} de novo predictions")
     if args.clusters:
         cl = psm_mod.read_clusters(args.clusters)
-        # If the cluster file carries no usable run name, fall back to scan
-        # number alone. Only safe for a single-run table, so check first.
-        keys = ["run_id", "scan_number"]
-        if cl["run_id"].eq("").all() or not set(cl["run_id"]) & set(df["run_id"]):
-            if df["run_id"].nunique() > 1:
-                sys.exit("Cluster file has no run identifiers but the QC table "
-                         "spans several runs. Re-run clustering on MGF files "
-                         "written by `msqc triage`, which embed run names in "
-                         "the TITLE line.")
-            cl = cl.drop(columns=["run_id"])
-            keys = ["scan_number"]
-        df = df.drop(columns=[c for c in ("cluster_id", "cluster_size",
-                                          "cluster_n_runs") if c in df.columns])
-        df = df.merge(cl, on=keys, how="left")
-        n = df["cluster_id"].notna().sum()
-        print(f"[annotate] attached cluster assignments for {n:,} spectra")
-        if n:
-            multi = df.loc[df["cluster_n_runs"].fillna(0) > 1, "cluster_id"].nunique()
-            print(f"[annotate]   {df['cluster_id'].nunique():,} clusters, "
-                  f"{multi:,} seen in more than one run")
-
+        df = attach(df, cl)
+        print(f"[annotate] attached {len(cl):,} cluster memberships")
     df.to_parquet(args.out, index=False)
     print(f"[annotate] wrote {args.out}")
 
@@ -428,7 +405,8 @@ def cmd_run(args):
     cmd_triage(argparse.Namespace(
         qc=qc, psm=args.psm, engine=args.engine, scorer=args.scorer,
         model=args.model, qc_threshold=args.qc_threshold,
-        min_tag=args.min_tag, keep_polymers=False, outdir=outdir))
+        min_tag=args.min_tag, keep_polymers=False, outdir=outdir,
+        max_qvalue=args.max_qvalue, assume_prefiltered=args.assume_prefiltered))
 
     cmd_report(argparse.Namespace(
         qc=os.path.join(outdir, "qc_triaged.parquet"),
@@ -484,12 +462,16 @@ def main(argv=None):
     t.add_argument("--qc-threshold", type=float, default=0.6)
     t.add_argument("--min-tag", type=int, default=3)
     t.add_argument("--keep-polymers", action="store_true")
+    t.add_argument("--max-qvalue", type=float, default=0.01)
+    t.add_argument("--assume-prefiltered", action="store_true",
+                   help="Explicitly declare PSMs without q-values already FDR-filtered")
     t.add_argument("--outdir", default="msqc_out")
     t.set_defaults(func=cmd_triage)
 
     a = sub.add_parser("annotate", help="attach Casanovo and falcon results")
     a.add_argument("--qc", required=True)
     a.add_argument("--casanovo", default=None)
+    a.add_argument("--manifest", default=None, help="MGF export .manifest.csv for Casanovo MGF/index results")
     a.add_argument("--clusters", default=None)
     a.add_argument("--out", default="qc_annotated.parquet")
     a.set_defaults(func=cmd_annotate)
@@ -530,6 +512,8 @@ def main(argv=None):
     rn.add_argument("--outdir", default="msqc_out")
     rn.add_argument("--scorer", default="rule", choices=["rule", "model"])
     rn.add_argument("--model", default=None)
+    rn.add_argument("--max-qvalue", type=float, default=0.01)
+    rn.add_argument("--assume-prefiltered", action="store_true")
     rn.add_argument("--qc-threshold", type=float, default=0.6)
     rn.add_argument("--min-tag", type=int, default=3)
     rn.add_argument("--threads", type=int, default=1,

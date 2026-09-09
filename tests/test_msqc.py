@@ -189,7 +189,7 @@ def test_triage_buckets_are_mutually_exclusive_and_complete():
     assert list(out["triage_class"]) == [
         "identified",
         "rescue_candidate",
-        "structured_non_peptide",
+        "structured_unresolved",
         "low_quality_unassigned",
         "polymer_contaminant",
     ]
@@ -257,7 +257,7 @@ def test_acetyl_trimethyl_ambiguity_is_flagged_with_required_resolution():
 
 
 def test_deamidation_is_flagged_against_isotope_error():
-    """The most common false PTM: +0.98402 vs a 13C peak at +0.99703."""
+    """The most common false PTM: +0.98402 vs a 13C peak at +1.00335."""
     r = ck.check_delta_mass_ambiguity(0.984016)
     assert "isotope" in r["delta_alternatives"].lower()
 
